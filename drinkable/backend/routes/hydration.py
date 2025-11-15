@@ -25,4 +25,11 @@ def add_hydration(payload: HydrationCreate, db: Session = Depends(get_db)):
     db.commit()
 
     bac_info = compute_bac(session, session.drinks, session.hydration, session.snacks)
-    return bac_info
+    return {
+        "session_id": session.id,
+        "user_id": session.user_id,
+        "drink_count": len(session.drinks),
+        "hydration_count": len(session.hydration),
+        "snack_count": len(session.snacks),
+        **bac_info,
+    }

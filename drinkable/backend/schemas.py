@@ -1,8 +1,11 @@
 from pydantic import BaseModel
 from datetime import datetime
+from typing import Optional
 
 class SessionCreate(BaseModel):
     user_id: str
+    weight_kg: Optional[float] = None
+    body_ratio: Optional[float] = None
 
 
 class DrinkCreate(BaseModel):

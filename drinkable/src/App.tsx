@@ -1,5 +1,5 @@
 import { AnimatePresence, motion } from 'framer-motion'
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import DrinkSetupScreen from './components/DrinkSetupScreen'
 import FriendDetailScreen from './components/FriendDetailScreen'
 import FriendsListScreen from './components/FriendsListScreen'
@@ -11,9 +11,29 @@ import type {
   DrinkSelection,
   DrinkType,
   FriendStatus,
+  Gender,
   UserProfile,
 } from './types'
 import { drinkTypes } from './data/drinks'
+
+const API_BASE = import.meta.env.VITE_API_BASE ?? 'http://localhost:8000'
+const WATER_GLASS_ML = 200
+
+interface BackendSnapshot {
+  session_id: string
+  user_id: string
+  drink_count: number
+  hydration_count: number
+  snack_count: number
+  bac: number
+  hydration_score: number
+  hydration_modifier: number
+  snack_modifier: number
+  baseline_rest_minutes: number
+  rest_minutes: number
+  hours_since_start: number
+  error?: string
+}
 
 const clamp = (value: number, min: number, max: number) =>
   Math.min(max, Math.max(min, value))
@@ -62,6 +82,12 @@ const paceFromScore = (score: number): BacState['pace'] => {
   return 'fast'
 }
 
+const bodyRatioForGender = (gender: Gender) => {
+  if (gender === 'female') return 0.55
+  if (gender === 'male') return 0.68
+  return 0.6
+}
+
 const friendsMock: FriendStatus[] = [
   { id: '1', nickname: 'Mia', characterLevel: 2, intoxicationPercent: 18, paceScore: 3 },
   { id: '2', nickname: 'Jordan', characterLevel: 4, intoxicationPercent: 42, paceScore: 6 },
@@ -72,6 +98,20 @@ type Screen = 'onboarding' | 'drinkSetup' | 'session' | 'friendsList' | 'friendD
 
 const App = () => {
   const [screen, setScreen] = useState<Screen>('onboarding')
+  const [sessionId, setSessionId] = useState<string | null>(null)
+  const [backendSnapshot, setBackendSnapshot] = useState<BackendSnapshot | null>(null)
+  const [backendLoading, setBackendLoading] = useState(false)
+  const [backendError, setBackendError] = useState<string | null>(null)
+  const [userId] = useState(() => {
+    const key = 'drinkable-user-id'
+    const saved = typeof window !== 'undefined' ? window.localStorage.getItem(key) : null
+    if (saved) return saved
+    const generated = crypto.randomUUID ? crypto.randomUUID() : `user-${Date.now()}`
+    if (typeof window !== 'undefined') {
+      window.localStorage.setItem(key, generated)
+    }
+    return generated
+  })
   const [profile, setProfile] = useState<UserProfile | null>(null)
   const [selection, setSelection] = useState<DrinkSelection | null>(null)
   const [drinkType, setDrinkType] = useState<DrinkType | null>(null)
@@ -88,6 +128,129 @@ const App = () => {
   const [history, setHistory] = useState<BacHistoryPoint[]>(() => makeHistory(0, 0))
   const [changeLog, setChangeLog] = useState<number[]>([])
   const friends = useMemo(() => friendsMock, [])
+
+  const refreshBackendSnapshot = async (activeId?: string) => {
+    const id = activeId ?? sessionId
+    if (!id) return null
+    setBackendLoading(true)
+    setBackendError(null)
+    try {
+      const response = await fetch(`${API_BASE}/api/session/status?session_id=${id}`)
+      const data = await response.json()
+      if (data.error) {
+        setBackendError(data.error)
+        return null
+      }
+      setBackendSnapshot(data)
+      return data as BackendSnapshot
+    } catch (error) {
+      console.error(error)
+      setBackendError('Cannot reach backend. Is FastAPI running on port 8000?')
+      return null
+    } finally {
+      setBackendLoading(false)
+    }
+  }
+
+  const startBackendSessionIfNeeded = async (): Promise<string | null> => {
+    if (sessionId) return sessionId
+    if (!profile) return null
+
+    setBackendLoading(true)
+    setBackendError(null)
+    try {
+      const response = await fetch(`${API_BASE}/api/session/start`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          user_id: userId,
+          weight_kg: profile.weightKg,
+          body_ratio: bodyRatioForGender(profile.gender),
+        }),
+      })
+      const data = await response.json()
+      if (!data.session_id) {
+        setBackendError(data.error ?? 'Unable to start backend session')
+        return null
+      }
+      setSessionId(data.session_id)
+      await refreshBackendSnapshot(data.session_id)
+      return data.session_id
+    } catch (error) {
+      console.error(error)
+      setBackendError('Cannot reach backend. Is FastAPI running on port 8000?')
+      return null
+    } finally {
+      setBackendLoading(false)
+    }
+  }
+
+  useEffect(() => {
+    if (profile && !sessionId) {
+      void startBackendSessionIfNeeded()
+    }
+  }, [profile, sessionId])
+
+  const logDrinkDelta = async (delta: number, currentSelection: DrinkSelection, currentType: DrinkType) => {
+    if (delta <= 0) return
+    const id = await startBackendSessionIfNeeded()
+    if (!id) return
+
+    setBackendLoading(true)
+    setBackendError(null)
+    try {
+      const response = await fetch(`${API_BASE}/api/drinks/add`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          session_id: id,
+          volume_ml: currentSelection.volumeMl * delta,
+          abv_percent: currentSelection.customAbv ?? currentType.defaultAbv,
+        }),
+      })
+      const data = await response.json()
+      if (data.error) {
+        setBackendError(data.error)
+        return
+      }
+      setBackendSnapshot(data)
+    } catch (error) {
+      console.error(error)
+      setBackendError('Failed to log drink to backend')
+    } finally {
+      setBackendLoading(false)
+    }
+  }
+
+  const logHydrationDelta = async (delta: number) => {
+    if (delta <= 0) return
+    const id = await startBackendSessionIfNeeded()
+    if (!id) return
+
+    setBackendLoading(true)
+    setBackendError(null)
+    try {
+      const response = await fetch(`${API_BASE}/api/hydration/add`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          session_id: id,
+          volume_ml: WATER_GLASS_ML * delta,
+        }),
+      })
+      const data = await response.json()
+      if (data.error) {
+        setBackendError(data.error)
+        return
+      }
+      setBackendSnapshot(data)
+    } catch (error) {
+      console.error(error)
+      setBackendError('Failed to log water to backend')
+    } finally {
+      setBackendLoading(false)
+    }
+  }
 
   const updateBacState = (count: number, timestamps: number[], water = waterGlasses) => {
     const rawBac = clamp(count * 0.02, 0, 0.25)
@@ -118,15 +281,27 @@ const App = () => {
     setScreen('session')
     setChangeLog([])
     updateBacState(nextSelection.count, [], waterGlasses)
+    if (drink) {
+      void logDrinkDelta(nextSelection.count, nextSelection, drink)
+    }
   }
 
   const handleDrinkCountChange = (nextCount: number) => {
+    const previousCount = selection?.count ?? 0
     setSelection((prev) => (prev ? { ...prev, count: nextCount } : prev))
     setChangeLog((prev) => {
       const updated = [...prev.slice(-3), Date.now()]
       updateBacState(nextCount, updated)
       return updated
     })
+    if (selection && drinkType) {
+      const delta = nextCount - previousCount
+      if (delta > 0) {
+        void logDrinkDelta(delta, selection, drinkType)
+      } else if (delta < 0 && sessionId) {
+        setBackendError('Backend only tracks new drinks right now.')
+      }
+    }
   }
 
   const handleChangeDrinkType = () => {
@@ -143,9 +318,16 @@ const App = () => {
   }
 
   const handleWaterChange = (nextWater: number) => {
+    const previous = waterGlasses
     setWaterGlasses(nextWater)
     if (selection) {
       updateBacState(selection.count, changeLog, nextWater)
+    }
+    const delta = nextWater - previous
+    if (delta > 0) {
+      void logHydrationDelta(delta)
+    } else if (delta < 0 && sessionId) {
+      setBackendError('Backend only tracks added water for now.')
     }
   }
 
@@ -208,17 +390,53 @@ const App = () => {
   }
 
   return (
-    <AnimatePresence mode="wait">
-      <motion.div
-        key={screen}
-        initial={{ opacity: 0, x: 30 }}
-        animate={{ opacity: 1, x: 0 }}
-        exit={{ opacity: 0, x: -30 }}
-        transition={{ duration: 0.25, ease: 'easeOut' }}
-      >
-        {renderScreen()}
-      </motion.div>
-    </AnimatePresence>
+    <>
+      <AnimatePresence mode="wait">
+        <motion.div
+          key={screen}
+          initial={{ opacity: 0, x: 30 }}
+          animate={{ opacity: 1, x: 0 }}
+          exit={{ opacity: 0, x: -30 }}
+          transition={{ duration: 0.25, ease: 'easeOut' }}
+        >
+          {renderScreen()}
+        </motion.div>
+      </AnimatePresence>
+
+      <div className="fixed bottom-4 right-4 w-[300px] rounded-3xl border border-slate-200 bg-white p-4 shadow-card">
+        <div className="mb-1 flex items-center justify-between">
+          <p className="text-sm font-semibold text-textPrimary">Backend session</p>
+          <button
+            type="button"
+            disabled={!sessionId || backendLoading}
+            onClick={() => void refreshBackendSnapshot()}
+            className="text-xs font-semibold text-brand disabled:text-slate-400"
+          >
+            Refresh
+          </button>
+        </div>
+        <p className="text-xs text-textSecondary">API base: {API_BASE}</p>
+        <p className="text-xs text-textSecondary">
+          Session: {sessionId ? `${sessionId.slice(0, 8)}…` : 'starting...'}
+        </p>
+
+        {backendSnapshot ? (
+          <div className="mt-2 space-y-1 text-sm text-textSecondary">
+            <p className="text-textPrimary">
+              BAC {backendSnapshot.bac.toFixed(3)} · Rest {Math.round(backendSnapshot.rest_minutes)} min
+            </p>
+            <p>
+              Drinks {backendSnapshot.drink_count} · Water {backendSnapshot.hydration_count} · Snacks {backendSnapshot.snack_count}
+            </p>
+          </div>
+        ) : (
+          <p className="mt-2 text-sm text-textSecondary">
+            {backendError ?? (backendLoading ? 'Contacting backend...' : 'Waiting for first log...')}
+          </p>
+        )}
+        {backendError && <p className="text-xs text-amber-600">{backendError}</p>}
+      </div>
+    </>
   )
 }
 

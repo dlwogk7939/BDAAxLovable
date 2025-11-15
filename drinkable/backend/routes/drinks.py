@@ -34,4 +34,11 @@ def add_drink(payload: DrinkCreate, db: Session = Depends(get_db)):
     snacks = session.snacks
 
     bac_info = compute_bac(session, drinks, hydration, snacks)
-    return bac_info
+    return {
+        "session_id": session.id,
+        "user_id": session.user_id,
+        "drink_count": len(drinks),
+        "hydration_count": len(hydration),
+        "snack_count": len(snacks),
+        **bac_info,
+    }
