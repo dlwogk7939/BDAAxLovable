@@ -1,1076 +1,567 @@
-import { useMemo, useState } from 'react'
+import type { ChangeEvent, FormEvent } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 import './App.css'
 
-const ETHANOL_DENSITY = 0.789 // g/ml
-const ELIMINATION_RATE_PER_HOUR = 0.015
-const TARGET_BAC = 0.05
-const HYDRATION_DECAY_MINUTES = 60
-const SNACK_EFFECT_WINDOW_MINUTES = 90
-
-const beverageCatalog = [
-  { id: 'beer', label: 'Beer', abv: 5 },
-  { id: 'wine', label: 'Wine', abv: 12 },
-  { id: 'soju', label: 'Soju', abv: 16.9 },
-  { id: 'makgeolli', label: 'Makgeolli', abv: 6 },
-  { id: 'whisky', label: 'Whisky', abv: 40 },
-  { id: 'vodka', label: 'Vodka', abv: 40 },
-  { id: 'gin', label: 'Gin', abv: 40 },
-  { id: 'rum', label: 'Rum', abv: 40 },
-  { id: 'tequila', label: 'Tequila', abv: 40 },
-  { id: 'brandy', label: 'Brandy', abv: 40 },
-]
-
-const containerCatalog = [
-  { id: 'standard-shot', label: 'Standard shot (44 ml)', ml: 44 },
-  { id: 'soju-shot', label: 'Soju shot (50 ml)', ml: 50 },
-  { id: 'beer-glass', label: 'Beer glass (355 ml)', ml: 355 },
-  { id: 'red-cup', label: 'Red cup (450 ml)', ml: 450 },
-  { id: 'wine-glass', label: 'Wine glass (150 ml)', ml: 150 },
-  { id: 'bottle', label: 'Bottle / can (500 ml)', ml: 500 },
-]
-
-const bodyWaterOptions = [
-  { id: 'male', label: 'Body type: Male', ratio: 0.68 },
-  { id: 'female', label: 'Body type: Female', ratio: 0.55 },
-  { id: 'custom', label: 'Custom ratio', ratio: 0.6 },
-]
-
-const waterOptions = [
-  { id: 'glass-200', label: 'Water glass (200 ml)', ml: 200 },
-  { id: 'bottle-330', label: 'Small bottle (330 ml)', ml: 330 },
-  { id: 'bottle-500', label: 'Sport bottle (500 ml)', ml: 500 },
-]
-
-const snackOptions = [
-  {
-    id: 'light-snack',
-    label: 'Light snack (chips / nuts)',
-    absorptionModifier: 0.95,
-    description: 'Small bite that slows the spike just a little.',
-  },
-  {
-    id: 'carb-heavy',
-    label: 'Carb-heavy snack (fries / bread)',
-    absorptionModifier: 0.9,
-    description: 'Adds a mild buffer to absorption.',
-  },
-  {
-    id: 'full-meal',
-    label: 'Full meal (protein + fat)',
-    absorptionModifier: 0.85,
-    description: 'Best for smoothing out BAC climbs.',
-  },
-]
-
-interface DrinkEntry {
-  id: string
-  beverageId: string
-  containerId: string
-  quantity: number
-  timestamp: string
-  volumeMl: number
-  abv: number
-  alcoholGrams: number
+type BacSummary = {
+  bac: number
+  hydration_score: number
+  hydration_modifier: number
+  snack_modifier: number
+  baseline_rest_minutes: number
+  rest_minutes: number
+  hours_since_start: number
 }
 
-interface ToleranceEntry {
-  id: string
-  beverageId: string
-  containerId: string
-  quantity: number
-  volumeMl: number
-  abv: number
-  alcoholGrams: number
+type AiDrinkPrediction = {
+  ai_drink_type: string
+  ai_volume_ml: number
+  ai_abv_percent: number
+  ai_confidence: number
 }
 
-interface HydrationEntry {
+type ActivityEntry = {
   id: string
-  waterId: string
-  quantity: number
-  volumeMl: number
+  type: 'session' | 'drink' | 'water' | 'snack' | 'ai'
+  detail: string
   timestamp: string
 }
 
-interface SnackEntry {
-  id: string
-  snackId: string
-  quantity: number
-  timestamp: string
+type BacHistoryPoint = {
+  bac: number
+  timestamp: number
 }
 
-const toDateTimeInputValue = (date: Date) => {
-  const local = new Date(date.getTime() - date.getTimezoneOffset() * 60000)
-  return local.toISOString().slice(0, 16)
+const rawBackend = (import.meta.env.VITE_BACKEND_URL as string | undefined) ?? 'http://localhost:8000'
+const API_BASE = rawBackend.endsWith('/api') ? rawBackend : `${rawBackend}/api`
+
+const clamp = (value: number, min: number, max: number) => Math.min(max, Math.max(min, value))
+
+const computePaceScore = (timestamps: number[]) => {
+  if (timestamps.length < 2) return 3
+  const recent = timestamps.slice(-3)
+  const intervals: number[] = []
+  for (let i = 1; i < recent.length; i += 1) {
+    intervals.push((recent[i] - recent[i - 1]) / 60000)
+  }
+  const avgMinutes = intervals.reduce((sum, dur) => sum + dur, 0) / intervals.length
+  const score = 10 - avgMinutes * 1.5
+  return clamp(Number(score.toFixed(1)), 0, 10)
 }
 
-const formatClock = (isoString: string) => {
-  const parsed = new Date(isoString)
-  if (Number.isNaN(parsed.getTime())) {
-    return '-'
-  }
-
-  return parsed.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' })
+const paceFromScore = (score: number) => {
+  if (score <= 3) return 'slow'
+  if (score <= 6) return 'normal'
+  return 'fast'
 }
 
-const bacBadge = (bac: number) => {
-  if (bac === 0) {
-    return 'Waiting for first entry'
-  }
-  if (bac < 0.03) {
-    return 'Comfort zone'
-  }
-  if (bac < 0.06) {
-    return 'Caution'
-  }
-  if (bac < 0.09) {
-    return 'Fast climb'
-  }
-  return 'Danger'
+const mockHistory = (bac: number): BacHistoryPoint[] => {
+  const points = 8
+  const now = Date.now()
+  return Array.from({ length: points }, (_, index) => {
+    const minutesAgo = (points - index - 1) * 15
+    const decayed = clamp(bac - minutesAgo * 0.002, 0, 0.25)
+    return { bac: Number(decayed.toFixed(3)), timestamp: now - minutesAgo * 60_000 }
+  })
 }
 
-const minutesBetween = (timestamp: string) => {
-  const parsed = new Date(timestamp)
-  if (Number.isNaN(parsed.getTime())) {
-    return Infinity
+const TrendChart = ({ history }: { history: BacHistoryPoint[] }) => {
+  if (!history.length) {
+    return <div className="chart-placeholder">Log a drink to unlock the trend.</div>
   }
-  return (Date.now() - parsed.getTime()) / (1000 * 60)
+
+  const width = 420
+  const height = 160
+  const maxBac = 0.25
+  const points = history
+    .map((point, index) => {
+      const x = (index / Math.max(history.length - 1, 1)) * width
+      const y = height - (clamp(point.bac, 0, maxBac) / maxBac) * height
+      return `${x},${clamp(y, 0, height)}`
+    })
+    .join(' ')
+
+  return (
+    <svg viewBox={`0 0 ${width} ${height}`} className="trend-chart" role="presentation">
+      <defs>
+        <linearGradient id="bacGradient" x1="0" y1="0" x2="1" y2="0">
+          <stop offset="0%" stopColor="#1F4EF5" />
+          <stop offset="100%" stopColor="#8BA8F9" />
+        </linearGradient>
+      </defs>
+      <polyline fill="none" stroke="url(#bacGradient)" strokeWidth={5} strokeLinecap="round" points={points} />
+    </svg>
+  )
 }
 
-const paceBadge = (paceMinutes: number) => {
-  if (!paceMinutes || paceMinutes === Infinity) {
-    return 'Not enough data'
+const jsonRequest = async <T,>(path: string, payload: unknown) => {
+  const res = await fetch(`${API_BASE}${path}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  })
+
+  if (!res.ok) {
+    const message = await res.text()
+    throw new Error(message || res.statusText)
   }
-  if (paceMinutes < 12) {
-    return 'Critical pace'
-  }
-  if (paceMinutes < 20) {
-    return 'Fast'
-  }
-  return 'Steady'
+
+  return (await res.json()) as T
+}
+
+const getStoredUserId = () => {
+  const key = 'drinkable-user-id'
+  const existing = localStorage.getItem(key)
+  if (existing) return existing
+  const fresh = crypto.randomUUID()
+  localStorage.setItem(key, fresh)
+  return fresh
 }
 
 function App() {
-  const defaultStart = () => {
-    const base = new Date()
-    base.setMinutes(base.getMinutes() - 15)
-    return toDateTimeInputValue(base)
+  const userId = useMemo(getStoredUserId, [])
+
+  const [sessionId, setSessionId] = useState('')
+  const [summary, setSummary] = useState<BacSummary | null>(null)
+  const [status, setStatus] = useState('Initialising session…')
+  const [error, setError] = useState('')
+  const [loading, setLoading] = useState(true)
+
+  const [drinkVolume, setDrinkVolume] = useState(350)
+  const [drinkAbv, setDrinkAbv] = useState(12)
+  const [hydrationVolume, setHydrationVolume] = useState(200)
+  const [snackType, setSnackType] = useState('Light snack')
+  const [snackModifier, setSnackModifier] = useState(0.95)
+  const [pendingAiDrink, setPendingAiDrink] = useState<AiDrinkPrediction | null>(null)
+  const [activity, setActivity] = useState<ActivityEntry[]>([])
+  const [bacHistory, setBacHistory] = useState<BacHistoryPoint[]>([])
+  const [drinkMoments, setDrinkMoments] = useState<number[]>([])
+
+  const pushActivity = (entry: Omit<ActivityEntry, 'id' | 'timestamp'>) => {
+    const now = new Date()
+    setActivity((prev) => [
+      {
+        id: crypto.randomUUID(),
+        timestamp: now.toISOString(),
+        ...entry,
+      },
+      ...prev,
+    ].slice(0, 8))
+
+    if (entry.type === 'drink') {
+      setDrinkMoments((prev) => [...prev.slice(-5), now.getTime()])
+    }
   }
 
-  const [weightKg, setWeightKg] = useState(70)
-  const [bodyType, setBodyType] = useState(bodyWaterOptions[0].id)
-  const [customRatio, setCustomRatio] = useState(0.6)
-  const [toleranceNote, setToleranceNote] = useState('About one bottle of soju')
-  const [toleranceEntries, setToleranceEntries] = useState<ToleranceEntry[]>([])
-  const [toleranceBeverage, setToleranceBeverage] = useState(beverageCatalog[0].id)
-  const [toleranceContainer, setToleranceContainer] = useState(containerCatalog[0].id)
-  const [toleranceQuantity, setToleranceQuantity] = useState(1)
-  const [sessionStart, setSessionStart] = useState(defaultStart)
-  const [hydrationEntries, setHydrationEntries] = useState<HydrationEntry[]>([])
-  const [selectedWater, setSelectedWater] = useState(waterOptions[0].id)
-  const [waterQuantity, setWaterQuantity] = useState(1)
-  const [snackEntries, setSnackEntries] = useState<SnackEntry[]>([])
-  const [selectedSnack, setSelectedSnack] = useState(snackOptions[0].id)
-  const [snackQuantity, setSnackQuantity] = useState(1)
-  const [selectedBeverage, setSelectedBeverage] = useState(beverageCatalog[0].id)
-  const [selectedContainer, setSelectedContainer] = useState(containerCatalog[0].id)
-  const [quantity, setQuantity] = useState(1)
-  const [drinks, setDrinks] = useState<DrinkEntry[]>([])
-
-  const distributionRatio = useMemo(() => {
-    if (bodyType === 'custom') {
-      return Math.min(0.85, Math.max(0.4, customRatio))
-    }
-
-    return (
-      bodyWaterOptions.find((option) => option.id === bodyType)?.ratio ??
-      bodyWaterOptions[0].ratio
-    )
-  }, [bodyType, customRatio])
-
-  const startDate = useMemo(() => {
-    const parsed = new Date(sessionStart)
-    return Number.isNaN(parsed.getTime()) ? new Date() : parsed
-  }, [sessionStart])
-
-  const hoursSinceStart = useMemo(() => {
-    const diff = Date.now() - startDate.getTime()
-    return diff > 0 ? diff / (1000 * 60 * 60) : 0
-  }, [startDate])
-
-  const totals = useMemo(() => {
-    return drinks.reduce(
-      (acc, drink) => {
-        acc.alcoholGrams += drink.alcoholGrams
-        acc.volumeMl += drink.volumeMl
-        acc.drinkUnits += drink.quantity
-        return acc
-      },
-      { alcoholGrams: 0, volumeMl: 0, drinkUnits: 0 }
-    )
-  }, [drinks])
-
-  const weightGrams = Math.max(1, weightKg * 1000)
-  const bacBeforeElimination =
-    totals.alcoholGrams > 0
-      ? (totals.alcoholGrams / (weightGrams * distributionRatio)) * 100
-      : 0
-
-  const bac = Math.max(
-    0,
-    bacBeforeElimination - ELIMINATION_RATE_PER_HOUR * hoursSinceStart
+  const startSession = useCallback(
+    async (opts?: { reset?: boolean }) => {
+      if (opts?.reset) {
+        setSessionId('')
+        setSummary(null)
+        setStatus('Starting fresh session…')
+      }
+      setLoading(true)
+      setError('')
+      try {
+        const data = await jsonRequest<{ session_id: string }>(
+          '/session/start',
+          { user_id: userId }
+        )
+        setSessionId(data.session_id)
+        setStatus('Session active')
+        pushActivity({ type: 'session', detail: 'Started new session' })
+      } catch (err) {
+        setError(err instanceof Error ? err.message : 'Failed to start session')
+      } finally {
+        setLoading(false)
+      }
+    },
+    [userId]
   )
 
-  const paceMinutes = totals.drinkUnits
-    ? (hoursSinceStart * 60) / totals.drinkUnits
-    : Infinity
+  useEffect(() => {
+    startSession()
+  }, [startSession])
 
-  const bacProgress = Math.min(100, (bac / 0.2) * 100)
-  const minutesToTarget =
-    bac > TARGET_BAC
-      ? Math.ceil(((bac - TARGET_BAC) / ELIMINATION_RATE_PER_HOUR) * 60)
-      : 0
-  const minutesForThirtyPercentDrop = bac
-    ? Math.ceil(((bac * 0.3) / ELIMINATION_RATE_PER_HOUR) * 60)
-    : 0
-
-  const latestDrink = drinks[0]
-  const calcBacImpact = (alcoholGrams: number) => {
-    return (alcoholGrams / (weightGrams * distributionRatio)) * 100
-  }
-  const minutesForLatestDrink = latestDrink
-    ? Math.ceil(
-        (calcBacImpact(latestDrink.alcoholGrams) / ELIMINATION_RATE_PER_HOUR) *
-          60
-      )
-    : 0
-
-  const toleranceTotals = useMemo(() => {
-    return toleranceEntries.reduce(
-      (acc, entry) => {
-        acc.alcoholGrams += entry.alcoholGrams
-        acc.volumeMl += entry.volumeMl
-        acc.drinkUnits += entry.quantity
-        return acc
-      },
-      { alcoholGrams: 0, volumeMl: 0, drinkUnits: 0 }
-    )
-  }, [toleranceEntries])
-
-  const toleranceBac = toleranceTotals.alcoholGrams
-    ? calcBacImpact(toleranceTotals.alcoholGrams)
-    : 0
-
-  const drinkTimeline = useMemo(() => {
-    if (drinks.length === 0) {
-      return []
-    }
-
-    const sorted = [...drinks].sort(
-      (a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime()
-    )
-
-    let cumulativeAlcohol = 0
-    return sorted.map((entry) => {
-      cumulativeAlcohol += entry.alcoholGrams
-      const entryTime = new Date(entry.timestamp)
-      const hoursElapsed = Math.max(
-        0,
-        (entryTime.getTime() - startDate.getTime()) / (1000 * 60 * 60)
-      )
-      const bacBefore = (cumulativeAlcohol / (weightGrams * distributionRatio)) * 100
-      const bacValue = Math.max(0, bacBefore - ELIMINATION_RATE_PER_HOUR * hoursElapsed)
-      return {
-        minutes: hoursElapsed * 60,
-        bac: bacValue,
-      }
+  useEffect(() => {
+    if (!summary) return
+    setBacHistory((prev) => {
+      const next = [...prev, { bac: summary.bac, timestamp: Date.now() }]
+      return next.slice(-10)
     })
-  }, [drinks, startDate, weightGrams, distributionRatio])
+  }, [summary])
 
-  const paceGraph = useMemo(() => {
-    if (drinkTimeline.length === 0) {
-      return {
-        points: '',
-        areaPath: '',
-        maxMinutes: 60,
-        maxBac: 0.08,
-        latestBac: 0,
-      }
+  const refreshSummary = (data: BacSummary) => {
+    setSummary(data)
+    setStatus('BAC updated')
+  }
+
+  const guardedAction = async (fn: () => Promise<void>) => {
+    if (!sessionId) {
+      setError('Session not ready yet.')
+      return
     }
+    setError('')
+    try {
+      await fn()
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Unexpected error')
+    }
+  }
 
-    const maxMinutes = Math.max(60, ...drinkTimeline.map((point) => point.minutes))
-    const maxBac = Math.max(0.08, ...drinkTimeline.map((point) => point.bac))
-
-    const coords = drinkTimeline.map((point) => {
-      const x = (point.minutes / maxMinutes) * 100
-      const y = 100 - (point.bac / maxBac) * 100
-      return { x, y }
+  const handleAddDrink = (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault()
+    guardedAction(async () => {
+      const data = await jsonRequest<BacSummary>('/drinks/add', {
+        session_id: sessionId,
+        volume_ml: Number(drinkVolume),
+        abv_percent: Number(drinkAbv),
+      })
+      refreshSummary(data)
+      pushActivity({ type: 'drink', detail: `${drinkVolume} ml @ ${drinkAbv}%` })
     })
+  }
 
-    const points = coords.map((coord) => `${coord.x},${coord.y}`).join(' ')
-    const areaPath = ['M0,100', ...coords.map((coord) => `L${coord.x},${coord.y}`), 'L100,100 Z'].join(' ')
+  const handleAddHydration = (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault()
+    guardedAction(async () => {
+      const data = await jsonRequest<BacSummary>('/hydration/add', {
+        session_id: sessionId,
+        volume_ml: Number(hydrationVolume),
+      })
+      refreshSummary(data)
+      pushActivity({ type: 'water', detail: `${hydrationVolume} ml hydration` })
+    })
+  }
 
-    return {
-      points,
-      areaPath,
-      maxMinutes,
-      maxBac,
-      latestBac: drinkTimeline[drinkTimeline.length - 1]?.bac ?? 0,
-    }
-  }, [drinkTimeline])
+  const handleAddSnack = (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault()
+    guardedAction(async () => {
+      const data = await jsonRequest<BacSummary>('/snacks/add', {
+        session_id: sessionId,
+        snack_type: snackType,
+        modifier: Number(snackModifier),
+      })
+      refreshSummary(data)
+      pushActivity({ type: 'snack', detail: `${snackType} · modifier ${snackModifier.toFixed(2)}` })
+    })
+  }
 
-  const hydrationTotals = useMemo(() => {
-    return hydrationEntries.reduce(
-      (acc, entry) => {
-        acc.volumeMl += entry.volumeMl
-        acc.occurrences += entry.quantity
-        return acc
-      },
-      { volumeMl: 0, occurrences: 0 }
-    )
-  }, [hydrationEntries])
+  const handleImageUpload = async (event: ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0]
+    if (!file) return
 
-  const hydrationScore = useMemo(() => {
-    return hydrationEntries.reduce((acc, entry) => {
-      const minutesAgo = minutesBetween(entry.timestamp)
-      if (minutesAgo > HYDRATION_DECAY_MINUTES) {
-        return acc
+    setLoading(true)
+    setError('')
+    try {
+      const formData = new FormData()
+      formData.append('file', file)
+      const res = await fetch(`${API_BASE}/analyze-cocktail`, { method: 'POST', body: formData })
+      if (!res.ok) {
+        const message = await res.text()
+        throw new Error(message || 'Image analysis failed')
       }
-      const weight = Math.max(0, 1 - minutesAgo / HYDRATION_DECAY_MINUTES)
-      return acc + entry.volumeMl * weight
-    }, 0)
-  }, [hydrationEntries])
-
-  const recentSnack = snackEntries[0]
-  const minutesSinceSnack = recentSnack ? minutesBetween(recentSnack.timestamp) : Infinity
-  const snackCatalogEntry = recentSnack
-    ? snackOptions.find((item) => item.id === recentSnack.snackId)
-    : undefined
-  const snackEffectActive = minutesSinceSnack <= SNACK_EFFECT_WINDOW_MINUTES
-  const snackRestModifier = snackEffectActive
-    ? snackCatalogEntry?.absorptionModifier ?? 1
-    : 1
-
-  const hydrationRestModifier = hydrationScore >= 800 ? 0.9 : hydrationScore >= 400 ? 1 : 1.15
-
-  const aiRestMinutes = minutesForThirtyPercentDrop
-    ? Math.max(
-        1,
-        Math.round(minutesForThirtyPercentDrop * hydrationRestModifier * snackRestModifier)
-      )
-    : 0
-
-  const hydrationInsight = (() => {
-    if (hydrationEntries.length === 0) {
-      return 'No water logged yet. Add at least 200 ml before your next drink.'
+      const data = (await res.json()) as AiDrinkPrediction
+      setPendingAiDrink(data)
+      setStatus('AI suggestion ready')
+      pushActivity({
+        type: 'ai',
+        detail: `${data.ai_drink_type} · ${data.ai_volume_ml} ml · ${data.ai_abv_percent}%`,
+      })
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Image analysis failed')
+    } finally {
+      setLoading(false)
+      event.target.value = ''
     }
-    if (hydrationScore >= 800) {
-      return 'Hydration looks excellent—keep sipping water every ~20 minutes.'
-    }
-    if (hydrationScore >= 400) {
-      return 'Solid hydration, but another glass soon will keep things smooth.'
-    }
-    return 'Hydration is lagging. Log a full glass to slow the next BAC bump.'
-  })()
-
-  const snackInsight = (() => {
-    if (!recentSnack) {
-      return 'No snack data yet. A quick bite can slow absorption spikes by 5–15%.'
-    }
-    const label = snackCatalogEntry?.label ?? 'Snack'
-    if (snackEffectActive) {
-      return `${label} ${Math.round(minutesSinceSnack)} min ago is buffering your current climb (~${Math.round(
-        (1 - snackRestModifier) * 100
-      )}% slower).`
-    }
-    return `${label} was logged ${Math.round(
-      minutesSinceSnack
-    )} min ago. Add another bite if you plan to keep drinking.`
-  })()
-
-  const handleAddDrink = (event: React.FormEvent<HTMLFormElement>) => {
-    event.preventDefault()
-
-    const beverage = beverageCatalog.find((item) => item.id === selectedBeverage)
-    const container = containerCatalog.find(
-      (item) => item.id === selectedContainer
-    )
-
-    if (!beverage || !container || quantity <= 0) {
-      return
-    }
-
-    const volumeMl = container.ml * quantity
-    const alcoholMl = volumeMl * (beverage.abv / 100)
-    const alcoholGrams = alcoholMl * ETHANOL_DENSITY
-
-    const entry: DrinkEntry = {
-      id: crypto.randomUUID
-        ? crypto.randomUUID()
-        : `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
-      beverageId: beverage.id,
-      containerId: container.id,
-      quantity,
-      timestamp: new Date().toISOString(),
-      volumeMl,
-      abv: beverage.abv,
-      alcoholGrams,
-    }
-
-    setDrinks((prev) => [entry, ...prev])
   }
 
-  const handleAddHydration = (event: React.FormEvent<HTMLFormElement>) => {
-    event.preventDefault()
+  const handleAddAiDrinkToSession = () => {
+    if (!pendingAiDrink) return
+    guardedAction(async () => {
+      const data = await jsonRequest<BacSummary>('/drinks/add', {
+        session_id: sessionId,
+        volume_ml: Number(pendingAiDrink.ai_volume_ml),
+        abv_percent: Number(pendingAiDrink.ai_abv_percent),
+      })
+      refreshSummary(data)
+      pushActivity({ type: 'drink', detail: `${pendingAiDrink.ai_drink_type} (AI)` })
+      setPendingAiDrink(null)
+    })
+  }
 
-    const option = waterOptions.find((item) => item.id === selectedWater)
-    if (!option || waterQuantity <= 0) {
-      return
+  const riskLevel = useMemo(() => {
+    if (!summary) return 'idle'
+    if (summary.bac < 0.03) return 'safe'
+    if (summary.bac < 0.08) return 'caution'
+    return 'danger'
+  }, [summary])
+
+  const riskMessage = useMemo(() => {
+    switch (riskLevel) {
+      case 'caution':
+        return 'Hydrate & slow down a bit.'
+      case 'danger':
+        return 'Pause drinking immediately and rest.'
+      case 'safe':
+        return 'You are in a comfortable zone.'
+      default:
+        return 'Log a drink to see guidance.'
     }
+  }, [riskLevel])
 
-    const volumeMl = option.ml * waterQuantity
-    const entry: HydrationEntry = {
-      id: crypto.randomUUID
-        ? crypto.randomUUID()
-        : `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
-      waterId: option.id,
-      quantity: waterQuantity,
-      volumeMl,
-      timestamp: new Date().toISOString(),
+  const intoxicationPercent = useMemo(() => {
+    if (!summary) return 0
+    const percent = (summary.bac / 0.25) * 100
+    return clamp(percent, 0, 100)
+  }, [summary])
+
+  const paceScore = useMemo(() => computePaceScore(drinkMoments), [drinkMoments])
+  const paceLabel = useMemo(() => paceFromScore(paceScore), [paceScore])
+  const pacePercent = clamp(paceScore / 10, 0, 1) * 100
+
+  const characterState = useMemo(() => {
+    if (intoxicationPercent < 30) {
+      return { emoji: '🙂', label: 'Relaxed explorer', description: riskMessage }
     }
-
-    setHydrationEntries((prev) => [entry, ...prev])
-  }
-
-  const handleRemoveHydration = (id: string) => {
-    setHydrationEntries((prev) => prev.filter((entry) => entry.id !== id))
-  }
-
-  const handleAddTolerance = (event: React.FormEvent<HTMLFormElement>) => {
-    event.preventDefault()
-
-    const beverage = beverageCatalog.find((item) => item.id === toleranceBeverage)
-    const container = containerCatalog.find(
-      (item) => item.id === toleranceContainer
-    )
-
-    if (!beverage || !container || toleranceQuantity <= 0) {
-      return
+    if (intoxicationPercent < 65) {
+      return { emoji: '😅', label: 'Tipsy adventurer', description: riskMessage }
     }
-
-    const volumeMl = container.ml * toleranceQuantity
-    const alcoholMl = volumeMl * (beverage.abv / 100)
-    const alcoholGrams = alcoholMl * ETHANOL_DENSITY
-
-    const entry: ToleranceEntry = {
-      id: crypto.randomUUID
-        ? crypto.randomUUID()
-        : `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
-      beverageId: beverage.id,
-      containerId: container.id,
-      quantity: toleranceQuantity,
-      volumeMl,
-      abv: beverage.abv,
-      alcoholGrams,
-    }
-
-    setToleranceEntries((prev) => [entry, ...prev])
-  }
-
-  const handleRemoveTolerance = (id: string) => {
-    setToleranceEntries((prev) => prev.filter((entry) => entry.id !== id))
-  }
-
-  const clearToleranceList = () => setToleranceEntries([])
-
-  const handleAddSnack = (event: React.FormEvent<HTMLFormElement>) => {
-    event.preventDefault()
-
-    const snack = snackOptions.find((item) => item.id === selectedSnack)
-    if (!snack || snackQuantity <= 0) {
-      return
-    }
-
-    const entry: SnackEntry = {
-      id: crypto.randomUUID
-        ? crypto.randomUUID()
-        : `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
-      snackId: snack.id,
-      quantity: snackQuantity,
-      timestamp: new Date().toISOString(),
-    }
-
-    setSnackEntries((prev) => [entry, ...prev])
-  }
-
-  const handleRemoveSnack = (id: string) => {
-    setSnackEntries((prev) => prev.filter((entry) => entry.id !== id))
-  }
-
-  const clearHydrationList = () => setHydrationEntries([])
-  const clearSnackList = () => setSnackEntries([])
-
-  const resetSession = () => {
-    setDrinks([])
-    setSessionStart(defaultStart())
-  }
+    return { emoji: '😵', label: 'Critical zone', description: riskMessage }
+  }, [intoxicationPercent, riskMessage])
 
   return (
-    <div className="app-shell">
-      <header className="hero">
-        <h1>Drinkable BAC Dashboard</h1>
-        <p className="subtitle">
-          Add image → AI guesses drink → confirm → BAC updates.
-        </p>
-      </header>
-
-      {!sessionId && <p>Starting session...</p>}
-
-      {bacData && (
-        <section className="status-card">
-          <h2>Current BAC</h2>
-          <div className="bac-value">
-            {bacData?.bac !== undefined ? bacData.bac.toFixed(3) : "0.000"}
-          </div>
-          <div className="status-meter">
-            <div className="meter">
-              <div className="meter-fill" style={{ width: `${bacProgress}%` }} />
-            </div>
-            <p className="meter-note">
-              {bac >= TARGET_BAC
-                ? `Roughly ${minutesToTarget} min until you drop below the caution line`
-                : 'Still below the caution line'}
-            </p>
-          </div>
+    <main className="app-shell">
+      <header className="app-header">
+        <div className="brand-intro">
+          <p className="eyebrow">Drinkable · AI guided</p>
+          <h1>Personal BAC Coach</h1>
+          <p>Track drinks, hydration, and smart breaks with one polished dashboard.</p>
         </div>
-
-        <div className="metrics-grid">
-          <div className="metric-card">
-            <p className="label">Total drinks</p>
-            <p className="metric-value">{totals.drinkUnits.toFixed(1)} servings</p>
-            <span className="chip">About {Math.round(totals.volumeMl)} ml</span>
+        <div className="session-card">
+          <div className="session-top">
+            <p className="label">Session ID</p>
+            <code>{sessionId || 'Starting…'}</code>
           </div>
-          <div className="metric-card">
-            <p className="label">Session length</p>
-            <p className="metric-value">
-              {hoursSinceStart < 0.1
-                ? 'Just getting started'
-                : `${hoursSinceStart.toFixed(2)} h`}
-            </p>
-            <span className="chip">Started at {formatClock(startDate.toISOString())}</span>
-          </div>
-          <div className="metric-card">
-            <p className="label">Current pace</p>
-            <p className="metric-value">{paceBadge(paceMinutes)}</p>
-            <span className="chip">
-              {paceMinutes === Infinity
-                ? 'Log your first drink'
-                : `${paceMinutes.toFixed(0)} min/drink`}
-            </span>
-          </div>
-        </div>
-
-        {bac > 0 && (
-          <div className="coaching">
-            <div>
-              <p>AI Coaching</p>
-              <h3>
-                {aiRestMinutes
-                  ? `Rest ${aiRestMinutes} min (hydration/snack adjusted) to slow your BAC climb by ~30%.`
-                  : 'Keep logging drinks to unlock pacing advice.'}
-              </h3>
-              {minutesForThirtyPercentDrop > 0 && (
-                <p className="fine-print">
-                  Baseline rest without modifiers: {minutesForThirtyPercentDrop} min
-                </p>
-              )}
-            </div>
-            <div>
-              {minutesForLatestDrink > 0 ? (
-                <p>Waiting at least {minutesForLatestDrink} min before the next drink keeps things safer.</p>
-              ) : (
-                <p>Log your first drink to unlock personalized pacing tips.</p>
-              )}
-            </div>
-            <div className="coaching-grid">
-              <div className="coaching-card">
-                <h4>Hydration insight</h4>
-                <p>{hydrationInsight}</p>
-                <span className="chip">Active water score: {Math.round(hydrationScore)} ml</span>
-              </div>
-              <div className="coaching-card">
-                <h4>Snack insight</h4>
-                <p>{snackInsight}</p>
-                <span className="chip">
-                  {recentSnack
-                    ? `Last snack ${Math.round(minutesSinceSnack)} min ago`
-                    : 'No snack logged yet'}
-                </span>
-              </div>
-            </div>
-          </div>
-        )}
-      </section>
-
-      <section className="panel graph-card">
-        <div className="graph-header">
-          <div>
-            <h2>Live pace graph</h2>
-            <p className="panel-desc">
-              Visualize BAC estimates per drink to understand how fast the session is escalating.
-            </p>
-          </div>
-          <div className="graph-meta">
-            <div>
-              <p className="label">Projected max BAC</p>
-              <p className="metric-value">{paceGraph.latestBac.toFixed(3)}</p>
-            </div>
-            <div>
-              <p className="label">Latest pace</p>
-              <p className="metric-value">
-                {paceMinutes === Infinity ? '—' : `${paceMinutes.toFixed(0)} min/drink`}
-              </p>
-            </div>
-          </div>
-        </div>
-        {drinkTimeline.length < 2 ? (
-          <div className="empty-state">
-            Need at least two drinks to draw the trend. Keep logging!
-          </div>
-        ) : (
-          <div className="graph-wrapper">
-            <svg viewBox="0 0 100 100" preserveAspectRatio="none" className="graph-svg">
-              <path d={paceGraph.areaPath} className="graph-area" />
-              <polyline points={paceGraph.points} className="graph-line" />
-            </svg>
-            <div className="graph-scale">
-              <span>0 min</span>
-              <span>{Math.round(paceGraph.maxMinutes)} min</span>
-            </div>
-            <div className="graph-scale vertical">
-              <span>{paceGraph.maxBac.toFixed(2)} BAC</span>
-              <span>0</span>
-            </div>
-          </div>
-        )}
-      </section>
-
-      <div className="panels-grid">
-        <section className="panel">
-          <h2>My baseline</h2>
-          <p className="panel-desc">Add body metrics and map your typical tolerance to fine tune the estimator.</p>
-          <div className="input-grid">
-            <label>
-              Weight (kg)
-              <input
-                type="number"
-                min={40}
-                max={130}
-                value={weightKg}
-                onChange={(event) => setWeightKg(Number(event.target.value) || 0)}
-              />
-            </label>
-            <label>
-              Session start
-              <input
-                type="datetime-local"
-                value={sessionStart}
-                onChange={(event) => setSessionStart(event.target.value)}
-              />
-            </label>
-            <label>
-              Body type / water ratio
-              <select
-                value={bodyType}
-                onChange={(event) => setBodyType(event.target.value)}
-              >
-                {bodyWaterOptions.map((option) => (
-                  <option value={option.id} key={option.id}>
-                    {option.label}
-                  </option>
-                ))}
-              </select>
-            </label>
-            {bodyType === 'custom' && (
-              <label>
-                Water ratio (0.4 ~ 0.85)
-                <input
-                  type="number"
-                  min={0.4}
-                  max={0.85}
-                  step={0.01}
-                  value={customRatio}
-                  onChange={(event) =>
-                    setCustomRatio(Number(event.target.value) || 0.6)
-                  }
-                />
-              </label>
-            )}
-            <label className="full-width">
-              Tolerance / condition note
-              <input
-                type="text"
-                value={toleranceNote}
-                onChange={(event) => setToleranceNote(event.target.value)}
-                placeholder="e.g. 1 bottle soju + 2 beers"
-              />
-            </label>
-          </div>
-          <p className="note">Tonight's note: {toleranceNote || 'Waiting for input'}</p>
-
-          <div className="tolerance-section">
-            <div className="tolerance-header">
-              <div>
-                <h3>Structured tolerance log</h3>
-                <p className="panel-desc small">
-                  Use the same selectors as the drink tracker to capture your usual mix.
-                </p>
-              </div>
-              {toleranceEntries.length > 0 && (
-                <button className="ghost small" type="button" onClick={clearToleranceList}>
-                  Clear list
-                </button>
-              )}
-            </div>
-            <form onSubmit={handleAddTolerance} className="input-grid compact-grid">
-              <label>
-                Beverage
-                <select
-                  value={toleranceBeverage}
-                  onChange={(event) => setToleranceBeverage(event.target.value)}
-                >
-                  {beverageCatalog.map((beverage) => (
-                    <option value={beverage.id} key={beverage.id}>
-                      {beverage.label} · {beverage.abv}% ABV
-                    </option>
-                  ))}
-                </select>
-              </label>
-              <label>
-                Container size
-                <select
-                  value={toleranceContainer}
-                  onChange={(event) => setToleranceContainer(event.target.value)}
-                >
-                  {containerCatalog.map((container) => (
-                    <option value={container.id} key={container.id}>
-                      {container.label}
-                    </option>
-                  ))}
-                </select>
-              </label>
-              <label>
-                Servings
-                <input
-                  type="number"
-                  min={0.5}
-                  step={0.5}
-                  value={toleranceQuantity}
-                  onChange={(event) =>
-                    setToleranceQuantity(Number(event.target.value) || 0)
-                  }
-                />
-              </label>
-              <button className="primary" type="submit">
-                Add to tolerance
-              </button>
-            </form>
-
-            {toleranceEntries.length === 0 ? (
-              <p className="note">No tolerance recipe yet. Add a few drinks to describe your usual capacity.</p>
-            ) : (
-              <div className="tolerance-summary">
-                <p>
-                  Typical night: {toleranceTotals.drinkUnits.toFixed(1)} servings · ~
-                  {Math.round(toleranceTotals.volumeMl)} ml · Alcohol{' '}
-                  {toleranceTotals.alcoholGrams.toFixed(1)} g
-                </p>
-                <span className="chip">
-                  Estimated peak BAC ≈ {toleranceBac.toFixed(3)}
-                </span>
-              </div>
-            )}
-
-            {toleranceEntries.length > 0 && (
-              <ul className="history-list tolerance-list">
-                {toleranceEntries.map((entry) => {
-                  const beverage = beverageCatalog.find(
-                    (item) => item.id === entry.beverageId
-                  )
-                  const container = containerCatalog.find(
-                    (item) => item.id === entry.containerId
-                  )
-                  return (
-                    <li key={entry.id}>
-                      <div>
-                        <strong>{beverage?.label ?? 'Beverage'}</strong> · {container?.label}
-                        <p className="detail">
-                          {entry.quantity} servings · {entry.volumeMl.toFixed(0)} ml · Alcohol{' '}
-                          {entry.alcoholGrams.toFixed(1)} g
-                        </p>
-                      </div>
-                      <button
-                        type="button"
-                        className="ghost tiny"
-                        onClick={() => handleRemoveTolerance(entry.id)}
-                      >
-                        Remove
-                      </button>
-                    </li>
-                  )
-                })}
-              </ul>
-            )}
-          </div>
-        </section>
-
-        <section className="panel">
-          <h2>Add a drink</h2>
-          <p className="panel-desc">Pick beverage, container, and servings to log instantly.</p>
-          <form onSubmit={handleAddDrink} className="input-grid">
-            <label>
-              Beverage
-              <select
-                value={selectedBeverage}
-                onChange={(event) => setSelectedBeverage(event.target.value)}
-              >
-                {beverageCatalog.map((beverage) => (
-                  <option value={beverage.id} key={beverage.id}>
-                    {beverage.label} · {beverage.abv}% ABV
-                  </option>
-                ))}
-              </select>
-            </label>
-            <label>
-              Container size
-              <select
-                value={selectedContainer}
-                onChange={(event) => setSelectedContainer(event.target.value)}
-              >
-                {containerCatalog.map((container) => (
-                  <option value={container.id} key={container.id}>
-                    {container.label}
-                  </option>
-                ))}
-              </select>
-            </label>
-            <label>
-              Servings
-              <input
-                type="number"
-                min={0.5}
-                step={0.5}
-                value={quantity}
-                onChange={(event) => setQuantity(Number(event.target.value) || 0)}
-              />
-            </label>
-            <button className="primary" type="submit">
-              Log drink
+          <div className="session-actions">
+            <button onClick={() => startSession({ reset: true })} disabled={loading}>
+              Restart session
+            </button>
+            <button
+              className="ghost"
+              type="button"
+              disabled={!sessionId}
+              onClick={() => sessionId && navigator.clipboard.writeText(sessionId)}
+            >
+              Copy
             </button>
           </div>
-        )}
+          {status && <span className="status-text">{status}</span>}
+          {error && <span className="error-text">{error}</span>}
+        </div>
+      </header>
+
+      <section className="card highlight-card">
+        <div className="character-row">
+          <div className="character-avatar" aria-hidden>
+            {characterState.emoji}
+          </div>
+          <div>
+            <p className="eyebrow">Current status</p>
+            <h2>{characterState.label}</h2>
+            <p className="muted">{characterState.description}</p>
+          </div>
+          <div className={`risk-tag risk-${riskLevel}`}>
+            <span>{summary ? summary.bac.toFixed(3) : '0.000'} BAC</span>
+            <small>{Math.round(intoxicationPercent)}% intoxication</small>
+          </div>
+        </div>
+        <div className="highlight-grid">
+          <article>
+            <p className="eyebrow">Rest recommendation</p>
+            <strong>{summary ? `${summary.rest_minutes} min` : '—'}</strong>
+            <span>Baseline {summary ? summary.baseline_rest_minutes.toFixed(1) : '—'} min</span>
+          </article>
+          <article>
+            <p className="eyebrow">Hydration logged</p>
+            <strong>{summary ? `${summary.hydration_score.toFixed(0)} ml` : '—'}</strong>
+            <span>Modifier ×{summary ? summary.hydration_modifier.toFixed(2) : '1.00'}</span>
+          </article>
+          <article>
+            <p className="eyebrow">Snack modifier</p>
+            <strong>×{summary ? summary.snack_modifier.toFixed(2) : '1.00'}</strong>
+            <span>Hours since start {summary ? summary.hours_since_start.toFixed(2) : '—'}</span>
+          </article>
+        </div>
       </section>
 
-        <section className="panel">
-          <h2>Hydration & snacks</h2>
-          <p className="panel-desc">
-            Capture water and bites in real time so the AI coach can react instantly.
-          </p>
-          <div className="split-grid">
-            <div className="split-card">
-              <div className="split-card-header">
+      <div className="content-grid">
+        <div className="primary-stack">
+          <section className="card trend-card">
+            <div className="card-header">
+              <div>
+                <p className="eyebrow">BAC trend</p>
+                <h3>{summary ? summary.bac.toFixed(3) : '0.000'}% BAC</h3>
+                <p className="muted">Updated whenever you log something.</p>
+              </div>
+              <div className="pace-chip">
+                <span>{paceLabel === 'fast' ? 'Fast pace' : paceLabel === 'normal' ? 'Normal pace' : 'Slow pace'}</span>
+                <strong>{paceScore.toFixed(1)} / 10</strong>
+              </div>
+            </div>
+            <div className="chart-wrapper">
+              <TrendChart history={bacHistory.length >= 2 ? bacHistory : mockHistory(summary?.bac ?? 0)} />
+            </div>
+            <div className="pace-track">
+              <div className="track">
+                <span style={{ left: `${pacePercent}%` }} />
+              </div>
+              <div className="track-labels">
+                <span>Slow</span>
+                <span>Normal</span>
+                <span>Fast</span>
+              </div>
+            </div>
+          </section>
+
+          <section className="card log-card">
+            <div className="log-grid">
+              <form onSubmit={handleAddDrink} className="log-form">
                 <div>
-                  <h3>Water intake</h3>
-                  <p className="panel-desc small">
-                    Aim for 200–300 ml every 20 minutes during active drinking.
-                  </p>
+                  <p className="eyebrow">Add drink</p>
+                  <h3>Manual entry</h3>
                 </div>
-                {hydrationEntries.length > 0 && (
-                  <button
-                    type="button"
-                    className="ghost small"
-                    onClick={clearHydrationList}
-                  >
-                    Clear water log
-                  </button>
+                <div className="fields">
+                  <label>
+                    Volume (ml)
+                    <input
+                      type="number"
+                      min={10}
+                      value={drinkVolume}
+                      onChange={(e) => setDrinkVolume(Number(e.target.value))}
+                    />
+                  </label>
+                  <label>
+                    ABV (%)
+                    <input
+                      type="number"
+                      step={0.1}
+                      min={0}
+                      value={drinkAbv}
+                      onChange={(e) => setDrinkAbv(Number(e.target.value))}
+                    />
+                  </label>
+                </div>
+                <button className="primary" type="submit">
+                  Log drink
+                </button>
+              </form>
+
+              <div className="ai-panel">
+                <div>
+                  <p className="eyebrow">Cocktail vision</p>
+                  <h3>Upload a photo</h3>
+                </div>
+                <label className="upload-tile">
+                  <input type="file" accept="image/*" onChange={handleImageUpload} />
+                  <span>Drop or click to upload</span>
+                </label>
+                {pendingAiDrink ? (
+                  <div className="ai-result">
+                    <div>
+                      <p className="muted">AI detected</p>
+                      <strong>{pendingAiDrink.ai_drink_type}</strong>
+                    </div>
+                    <p>
+                      {pendingAiDrink.ai_volume_ml} ml · {pendingAiDrink.ai_abv_percent}% ·
+                      &nbsp;{(pendingAiDrink.ai_confidence * 100).toFixed(0)}% confidence
+                    </p>
+                    <button className="primary" type="button" onClick={handleAddAiDrinkToSession}>
+                      Add this drink
+                    </button>
+                  </div>
+                ) : (
+                  <p className="muted">AI will suggest volume & ABV before you commit.</p>
                 )}
               </div>
-              <form onSubmit={handleAddHydration} className="input-grid compact-grid">
+            </div>
+
+            <div className="log-grid secondary">
+              <form onSubmit={handleAddHydration} className="log-form compact">
+                <div>
+                  <p className="eyebrow">Hydration</p>
+                  <h3>Add water</h3>
+                </div>
                 <label>
-                  Container
-                  <select
-                    value={selectedWater}
-                    onChange={(event) => setSelectedWater(event.target.value)}
-                  >
-                    {waterOptions.map((option) => (
-                      <option value={option.id} key={option.id}>
-                        {option.label}
-                      </option>
-                    ))}
-                  </select>
-                </label>
-                <label>
-                  Count
+                  Water (ml)
                   <input
                     type="number"
-                    min={0.5}
-                    step={0.5}
-                    value={waterQuantity}
-                    onChange={(event) => setWaterQuantity(Number(event.target.value) || 0)}
+                    min={50}
+                    value={hydrationVolume}
+                    onChange={(e) => setHydrationVolume(Number(e.target.value))}
                   />
                 </label>
                 <button className="primary" type="submit">
                   Log water
                 </button>
               </form>
-              {hydrationEntries.length > 0 ? (
-                <>
-                  <p className="note">
-                    Logged {hydrationTotals.occurrences.toFixed(1)} servings · ~
-                    {Math.round(hydrationTotals.volumeMl)} ml total water
-                  </p>
-                  <ul className="history-list tolerance-list">
-                    {hydrationEntries.map((entry) => {
-                      const option = waterOptions.find((item) => item.id === entry.waterId)
-                      return (
-                        <li key={entry.id}>
-                          <div>
-                            <strong>{option?.label ?? 'Water'}</strong>
-                            <p className="detail">
-                              {entry.quantity} servings · {entry.volumeMl.toFixed(0)} ml
-                            </p>
-                          </div>
-                          <button
-                            type="button"
-                            className="ghost tiny"
-                            onClick={() => handleRemoveHydration(entry.id)}
-                          >
-                            Remove
-                          </button>
-                        </li>
-                      )
-                    })}
-                  </ul>
-                </>
-              ) : (
-                <p className="note">No water logged yet.</p>
-              )}
-            </div>
 
-            <div className="split-card">
-              <div className="split-card-header">
+              <form onSubmit={handleAddSnack} className="log-form compact">
                 <div>
-                  <h3>Snack buffer</h3>
-                  <p className="panel-desc small">
-                    Snacks help slow absorption; log them to adjust AI cues.
-                  </p>
+                  <p className="eyebrow">Snacks</p>
+                  <h3>Pace modifiers</h3>
                 </div>
-                {snackEntries.length > 0 && (
-                  <button
-                    type="button"
-                    className="ghost small"
-                    onClick={clearSnackList}
-                  >
-                    Clear snack log
-                  </button>
-                )}
-              </div>
-              <form onSubmit={handleAddSnack} className="input-grid compact-grid">
                 <label>
-                  Snack type
-                  <select
-                    value={selectedSnack}
-                    onChange={(event) => setSelectedSnack(event.target.value)}
-                  >
-                    {snackOptions.map((option) => (
-                      <option value={option.id} key={option.id}>
-                        {option.label}
-                      </option>
-                    ))}
-                  </select>
+                  Description
+                  <input type="text" value={snackType} onChange={(e) => setSnackType(e.target.value)} />
                 </label>
                 <label>
-                  Portions
+                  Modifier (0.8 ~ 1.2)
                   <input
                     type="number"
+                    step={0.05}
                     min={0.5}
-                    step={0.5}
-                    value={snackQuantity}
-                    onChange={(event) => setSnackQuantity(Number(event.target.value) || 0)}
+                    max={1.5}
+                    value={snackModifier}
+                    onChange={(e) => setSnackModifier(Number(e.target.value))}
                   />
                 </label>
                 <button className="primary" type="submit">
                   Log snack
                 </button>
               </form>
-              {snackEntries.length > 0 ? (
-                <>
-                  <p className="note">
-                    Logged {snackEntries.length} snack events in this session.
-                  </p>
-                  <ul className="history-list tolerance-list">
-                    {snackEntries.map((entry) => {
-                      const snack = snackOptions.find((item) => item.id === entry.snackId)
-                      return (
-                        <li key={entry.id}>
-                          <div>
-                            <strong>{snack?.label ?? 'Snack'}</strong>
-                            <p className="detail">
-                              {entry.quantity} portion(s) · {snack?.description}
-                            </p>
-                          </div>
-                          <button
-                            type="button"
-                            className="ghost tiny"
-                            onClick={() => handleRemoveSnack(entry.id)}
-                          >
-                            Remove
-                          </button>
-                        </li>
-                      )
-                    })}
-                  </ul>
-                </>
-              ) : (
-                <p className="note">No snacks logged yet.</p>
-              )}
             </div>
-          </div>
-        </section>
+          </section>
+        </div>
+
+        <aside className="secondary-stack">
+          <section className="card timeline-card">
+            <div className="card-header">
+              <div>
+                <p className="eyebrow">Activity timeline</p>
+                <h3>Latest actions</h3>
+              </div>
+            </div>
+            {activity.length === 0 ? (
+              <p className="muted">Waiting for your first log…</p>
+            ) : (
+              <ul className="timeline-list">
+                {activity.map((entry) => (
+                  <li key={entry.id}>
+                    <div>
+                      <span className={`chip chip-${entry.type}`}>{entry.type}</span>
+                      <p>{entry.detail}</p>
+                    </div>
+                    <time>{new Date(entry.timestamp).toLocaleTimeString()}</time>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </section>
+          {loading && <p className="muted">Processing…</p>}
+        </aside>
       </div>
-
-      <section className="panel">
-        <h2>Timeline</h2>
-        {drinks.length === 0 ? (
-          <div className="empty-state">
-            No drinks recorded yet. Add your first one!
-          </div>
-        ) : (
-          <ul className="history-list">
-            {drinks.map((drink) => {
-              const beverage = beverageCatalog.find(
-                (item) => item.id === drink.beverageId
-              )
-              const container = containerCatalog.find(
-                (item) => item.id === drink.containerId
-              )
-              return (
-                <li key={drink.id}>
-                  <div>
-                    <strong>{beverage?.label ?? 'Beverage'}</strong> · {container?.label}
-                    <p className="detail">
-                      {drink.quantity} servings · {drink.volumeMl.toFixed(0)} ml · Alcohol{' '}
-                      {drink.alcoholGrams.toFixed(1)} g
-                    </p>
-                  </div>
-                  <div className="time">{formatClock(drink.timestamp)}</div>
-                </li>
-              )
-            })}
-          </ul>
-        )}
-      </section>
-
-      {loading && <p>Processing...</p>}
-    </div>
-  );
+    </main>
+  )
 }
+
+export default App
