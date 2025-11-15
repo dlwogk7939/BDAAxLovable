@@ -1,5 +1,14 @@
 import type { CharacterLevelConfig } from '../types'
 
+export const characterImages: Record<number, string> = {
+  0: '/src/assets/characters/char_0.png',
+  1: '/src/assets/characters/char_1.png',
+  2: '/src/assets/characters/char_2.png',
+  3: '/src/assets/characters/char_3.png',
+  4: '/src/assets/characters/char_4.png',
+  5: '/src/assets/characters/char_5.png',
+}
+
 export const characterLevels: CharacterLevelConfig[] = [
   {
     level: 0,
