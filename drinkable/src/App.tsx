@@ -1,5 +1,5 @@
 import { AnimatePresence, motion } from 'framer-motion'
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import DrinkSetupScreen from './components/DrinkSetupScreen'
 import FriendDetailScreen from './components/FriendDetailScreen'
 import FriendsListScreen from './components/FriendsListScreen'
@@ -128,6 +128,7 @@ const App = () => {
   const [history, setHistory] = useState<BacHistoryPoint[]>(() => makeHistory(0, 0))
   const [changeLog, setChangeLog] = useState<number[]>([])
   const friends = useMemo(() => friendsMock, [])
+  const photoInputRef = useRef<HTMLInputElement | null>(null)
 
   const refreshBackendSnapshot = async (activeId?: string) => {
     const id = activeId ?? sessionId
@@ -309,8 +310,43 @@ const App = () => {
   }
 
   const handleTakePhoto = () => {
-    // Placeholder - later it will open camera/AI flow
-    console.info('Preparing drink photo recognition...')
+    if (photoInputRef.current) {
+      photoInputRef.current.value = ''
+      photoInputRef.current.click()
+    }
+  }
+
+  const handlePhotoSelected = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0]
+    if (!file) return
+    const id = await startBackendSessionIfNeeded()
+    if (!id) {
+      setBackendError('Session not ready yet. Try again in a moment.')
+      return
+    }
+
+    setBackendLoading(true)
+    setBackendError(null)
+    try {
+      const formData = new FormData()
+      formData.append('file', file)
+      formData.append('session_id', id)
+      const response = await fetch(`${API_BASE}/api/analyze-cocktail`, {
+        method: 'POST',
+        body: formData,
+      })
+      const data = await response.json()
+      if (data.error) {
+        setBackendError(data.error)
+        return
+      }
+      await refreshBackendSnapshot(id)
+    } catch (error) {
+      console.error(error)
+      setBackendError('Failed to analyze image. Is the backend running with OPENAI_API_KEY?')
+    } finally {
+      setBackendLoading(false)
+    }
   }
 
   const handleDrinkSetupBack = () => {
@@ -402,6 +438,14 @@ const App = () => {
           {renderScreen()}
         </motion.div>
       </AnimatePresence>
+
+      <input
+        ref={photoInputRef}
+        type="file"
+        accept="image/*"
+        className="hidden"
+        onChange={handlePhotoSelected}
+      />
 
       <div className="fixed bottom-4 right-4 w-[300px] rounded-3xl border border-slate-200 bg-white p-4 shadow-card">
         <div className="mb-1 flex items-center justify-between">

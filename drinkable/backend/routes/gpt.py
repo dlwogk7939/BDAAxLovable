@@ -8,6 +8,7 @@ from PIL import Image
 import pillow_heif
 import os
 from uuid import uuid4
+from typing import Optional
 
 from ..services.bac_engine import compute_bac
 from ..database import get_db
@@ -60,7 +61,9 @@ def convert_to_jpeg(image_bytes: bytes, content_type: str) -> bytes:
 
 @router.post("/analyze-cocktail")
 async def analyze_cocktail(
-    file: UploadFile = File(...)
+    file: UploadFile = File(...),
+    session_id: Optional[str] = Form(None),
+    db: Session = Depends(get_db),
 ):
     """
     1. Convert image → JPEG
@@ -73,6 +76,11 @@ async def analyze_cocktail(
     # --------------------------
     # VALIDATE SESSION
     # --------------------------
+    session = None
+    if session_id:
+        session = db.query(DbSession).filter_by(id=session_id).first()
+        if not session:
+            return {"error": "session not found"}
 
     # --------------------------
     # READ & CONVERT IMAGE
@@ -96,24 +104,29 @@ async def analyze_cocktail(
     # --------------------------
     # GPT API CALL
     # --------------------------
-    completion = client.chat.completions.create(
-        model="gpt-4.1",
-        response_format={"type": "json_object"},
-        messages=[
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": prompt},
-                    {
-                        "type": "image_url",
-                        "image_url": {"url": f"data:image/jpeg;base64,{b64}"}
-                    },
-                ],
-            }
-        ]
-    )
+    if not client.api_key:
+        return {"error": "OPENAI_API_KEY not configured"}
 
-    ai = json.loads(completion.choices[0].message.content)
+    try:
+        completion = client.chat.completions.create(
+            model="gpt-4.1",
+            response_format={"type": "json_object"},
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": f"data:image/jpeg;base64,{b64}"}
+                        },
+                    ],
+                }
+            ]
+        )
+        ai = json.loads(completion.choices[0].message.content)
+    except Exception as exc:
+        return {"error": f"gpt_error: {exc}"}
 
     # Example GPT output:
     # {
@@ -124,7 +137,21 @@ async def analyze_cocktail(
     # }
 
     # --------------------------
-    # AUTO-CREATE DRINK ENTRY
+    # AUTO-CREATE DRINK ENTRY (if session provided)
+    # --------------------------
+    created_bac = None
+    if session:
+        drink = Drink(
+            id=str(uuid4()),
+            session_id=session.id,
+            volume_ml=float(ai.get("volume_ml", 0) or 0),
+            abv_percent=float(ai.get("abv_percent", 0) or 0),
+            alcohol_grams=(float(ai.get("volume_ml", 0) or 0) * (float(ai.get("abv_percent", 0) or 0) / 100)) * 0.789,
+        )
+        db.add(drink)
+        db.commit()
+        db.refresh(drink)
+        created_bac = compute_bac(session, session.drinks, session.hydration, session.snacks)
 
     # --------------------------
     # RETURN AI DRINK + BAC
@@ -133,5 +160,9 @@ async def analyze_cocktail(
         "ai_drink_type": ai.get("drink_type"),
         "ai_volume_ml": ai.get("volume_ml"),
         "ai_abv_percent": ai.get("abv_percent"),
-        "ai_confidence": ai.get("confidence")
+        "ai_confidence": ai.get("confidence"),
+        "session_id": session.id if session else None,
+        "bac": created_bac.get("bac") if created_bac else None,
+        "rest_minutes": created_bac.get("rest_minutes") if created_bac else None,
+        "hydration_score": created_bac.get("hydration_score") if created_bac else None,
     }
